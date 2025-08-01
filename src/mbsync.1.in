@@ -112,7 +112,8 @@ Enable debugging categories:
 \fBs\fR, \fBsync\fR - print synchronization debug info
 .in -4
 All categories except \fBcrash\fR implicitly enable \fIverbose\fR mode.
-Without category specification, all categories except net-all are enabled.
+Without category specification, all categories except net-all and driver-all
+are enabled.
 .TP
 \fB-q\fR, \fB--quiet\fR
 Suppress progress counters (this is implicit if stdout is no TTY,
