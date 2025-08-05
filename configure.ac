@@ -251,7 +251,7 @@ if test "x$have_macos_keychain" != xno; then
     AC_SUBST(KEYCHAIN_LIBS, ["-Wl,-framework,Security,-framework,CoreFoundation"])
 fi
 
-RELEASE_DATE=`date -r $0 +%F`
+RELEASE_DATE=`date -r VERSION +%F`
 AC_SUBST(RELEASE_DATE)
 
 AC_CONFIG_FILES([Makefile src/Makefile src/mbsync.1 src/mdconvert.1 isync.spec])
