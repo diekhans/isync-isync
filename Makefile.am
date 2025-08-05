@@ -4,7 +4,7 @@
 
 SUBDIRS = src
 bin_SCRIPTS = mbsync-get-cert
-EXTRA_DIST = LICENSES VERSION debian isync.spec $(bin_SCRIPTS)
+EXTRA_DIST = LICENSES VERSION debian isync.spec version.sh $(bin_SCRIPTS)
 
 cov-scan: clean
 	/opt/cov-analysis-*/bin/cov-build --dir cov-int $(MAKE)
