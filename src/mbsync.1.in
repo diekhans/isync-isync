@@ -845,8 +845,9 @@ Mutt always does that, while mu4e needs to be configured to do it:
 .in -4
 .br
 The general expectation is that a completely new filename is generated
-as if the message was new, but stripping the \fB,U=\fIxxx\fR infix is
-sufficient as well.
+as if the message was new, except that the flag suffix (\fB:2,xxx\fR)
+needs to be preserved.
+But stripping the \fB,U=\fInnn\fR infix is sufficient as well.
 .
 .SH INHERENT PROBLEMS
 Changes done after \fBmbsync\fR has retrieved the message list will not be
