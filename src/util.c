@@ -796,6 +796,8 @@ mkdir_p( char *path, int len )
 	if (!mkdir( path, 0700 ) || errno == EEXIST)
 		return 0;
 	char *p = memrchr( path, '/', (size_t)len );
+	if (!p)
+		return -1;  // mkdir() already set errno
 	*p = 0;
 	if (mkdir_p( path, (int)(p - path) )) {
 		*p = '/';
