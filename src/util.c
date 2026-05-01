@@ -454,12 +454,18 @@ vasprintf( char **strp, const char *fmt, va_list ap )
 void *
 memrchr( const void *s, int c, size_t n )
 {
-	u_char *b = (u_char *)s, *e = b + n;
+	const uchar *b = s;
+	const uchar *e = b + n;
 
-	while (--e >= b)
-		if (*e == c)
+	while (--e >= b) {
+		if (*e == c) {
+DIAG_PUSH
+DIAG_DISABLE("-Wcast-qual")
 			return (void *)e;
-	return 0;
+DIAG_POP
+		}
+	}
+	return NULL;
 }
 #endif
 
