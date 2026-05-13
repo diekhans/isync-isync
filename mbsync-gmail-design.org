@@ -1,0 +1,602 @@
+#+TITLE: Gmail X-GM-LABELS ↔ IMAP Keywords Synchronization Design
+#+AUTHOR: Design Document
+#+DATE: 2026-05-13
+
+* Problem Statement
+
+Gmail IMAP silently drops IMAP keywords (custom flags beyond the standard
+=\Seen=, =\Answered=, =\Flagged=, =\Draft=, =\Deleted=). This means:
+
+- Keywords set on messages synced TO Gmail are lost
+- Keywords cannot round-trip through Gmail
+- Dovecot ↔ Gmail sync loses keyword metadata
+
+Gmail does support arbitrary labels via the proprietary =X-GM-LABELS= IMAP
+extension (capability =X-GM-EXT-1=).
+
+* Proposed Solution
+
+Implement bidirectional mapping between IMAP keywords and Gmail's =X-GM-LABELS=:
+
+| Direction           | Transformation                    |
+|---------------------+-----------------------------------|
+| Dovecot → Gmail     | Keywords → X-GM-LABELS            |
+| Gmail → Dovecot     | X-GM-LABELS → Keywords            |
+
+* Current Codebase State
+
+** Keywords: Explicitly Disabled
+
+The codebase has commented-out keyword support:
+
+#+begin_src c
+// driver.h:71
+char *msgid;  /* owned */
+/* string_list_t *keywords; */  // <-- Disabled
+
+// sync_p.h:38
+/* string_list_t *keywords; */  // Same
+#+end_src
+
+The TODO file explicitly notes:
+#+begin_quote
+handle custom flags (keywords).
+this is impeded by there being no Maildir-side standard.
+#+end_quote
+
+** X-GM-LABELS: Not Supported
+
+- No references to =X-GM-LABELS= in codebase
+- No =X-GM-EXT-1= capability detection
+- No Gmail-specific capability enum entries
+- PERMANENTFLAGS parsing only checks for =$FORWARDED=
+
+** Flag System: 6 Fixed Bits
+
+#+begin_src c
+// driver.h:38-44
+#define msg_flags_enum(fn) \
+    fn(F, DRAFT)      /* 'D' */ \
+    fn(F, FLAGGED)    /* 'F' */ \
+    fn(F, FORWARDED)  /* 'P' */ \
+    fn(F, ANSWERED)   /* 'R' */ \
+    fn(F, SEEN)       /* 'S' */ \
+    fn(F, DELETED)    /* 'T' */
+#+end_src
+
+* Implementation Design
+
+** 1. Gmail Capability Detection
+
+Add to =drv_imap.c=:
+
+#+begin_src c
+enum CAPABILITY {
+    // ... existing ...
+    X_GM_EXT_1,        // Gmail extensions
+    // ...
+};
+
+static const char *cap_list[] = {
+    // ... existing ...
+    "X-GM-EXT-1",
+};
+#+end_src
+
+** 2. Data Structures
+
+*** Enable keywords in message/sync structures
+
+#+begin_src c
+// driver.h - uncomment and use
+typedef struct {
+    struct string_list_s *next;
+    char str[];
+} string_list_t;
+
+#define MESSAGE(message) \
+    message *next; \
+    struct sync_rec *srec; \
+    char *msgid; \
+    string_list_t *keywords;  // <-- Enable this \
+    uint size; \
+    uint uid; \
+    uchar flags, status; \
+    char tuid[TUIDL];
+#+end_src
+
+*** Sync record keyword tracking
+
+#+begin_src c
+// sync_p.h
+typedef struct sync_rec {
+    struct sync_rec *next;
+    string_list_t *keywords;       // Current merged keywords
+    string_list_t *akeywords[2];   // Keywords to add (far/near)
+    string_list_t *dkeywords[2];   // Keywords to delete (far/near)
+    uint uid[2];
+    message_t *msg[2];
+    ushort status;
+    uchar flags, pflags, aflags[2], dflags[2];
+    char tuid[TUIDL];
+} sync_rec_t;
+#+end_src
+
+** 3. X-GM-LABELS FETCH Parsing
+
+Gmail returns labels in FETCH responses:
+
+#+begin_example
+* 1 FETCH (UID 123 FLAGS (\Seen) X-GM-LABELS ("Label1" "Label2" "\\Important"))
+#+end_example
+
+Extend =ParseFetchState= enum and parsing:
+
+#+begin_src c
+// drv_imap.c
+enum ParseFetchState {
+    FetchUid,
+    FetchFlags,
+    FetchDate,
+    FetchSize,
+    FetchBody,
+    FetchGMLabels,    // <-- Add this
+};
+
+// In fetch_atom() - add case for X-GM-LABELS
+if (equals_upper(val, len, "X-GM-LABELS", 11)) {
+    ctx->parse_fetch_state = FetchGMLabels;
+    return LIST_NEXT;
+}
+#+end_src
+
+** 4. X-GM-LABELS STORE Commands
+
+Gmail accepts label modifications:
+
+#+begin_example
+UID STORE 123 +X-GM-LABELS ("NewLabel")
+UID STORE 123 -X-GM-LABELS ("OldLabel")
+UID STORE 123 X-GM-LABELS.SILENT ("Label1" "Label2")
+#+end_example
+
+Add =imap_set_msg_keywords()= function parallel to =imap_set_msg_flags()=.
+
+** 5. Keyword/Label Synchronization Logic
+
+*** Core mapping function
+
+#+begin_src c
+// New: keyword_label_map.c
+
+// Convert keyword to Gmail label (may need encoding)
+char *keyword_to_gm_label(const char *keyword);
+
+// Convert Gmail label to keyword (filter system labels)
+char *gm_label_to_keyword(const char *label);
+
+// System labels to skip (or handle specially)
+// "\\Inbox", "\\Sent", "\\Draft", "\\Spam", "\\Trash", "\\Important", "\\Starred"
+#+end_src
+
+*** Sync flow modification (sync.c)
+
+#+begin_src c
+// After flag sync, sync keywords/labels
+if (svars->ctx[t]->has_gm_labels) {
+    // Gmail store: use X-GM-LABELS
+    sync_keywords_as_gm_labels(svars, t);
+} else {
+    // Standard IMAP: use STORE FLAGS for keywords
+    sync_keywords_as_flags(svars, t);
+}
+#+end_src
+
+** 6. Driver Interface Extensions
+
+#+begin_src c
+// driver.h - add to struct driver
+
+// Get keywords for a message (parsed from FLAGS or X-GM-LABELS)
+string_list_t *(*get_msg_keywords)(store_t *ctx, message_t *msg);
+
+// Set keywords (via FLAGS or X-GM-LABELS depending on store type)
+void (*set_msg_keywords)(store_t *ctx, message_t *msg, uint uid,
+                         string_list_t *add, string_list_t *del,
+                         void (*cb)(int sts, void *aux), void *aux);
+
+// Query if store supports keywords natively or via labels
+xint (*get_keyword_caps)(store_t *ctx);
+// Returns: 0 = no support, KW_FLAGS = via FLAGS, KW_GMLABELS = via X-GM-LABELS
+#+end_src
+
+** 7. Journal Format Extension
+
+Current format uses single chars for 6 flags. Need to extend for keywords:
+
+#+begin_example
+# Current format
++ 123 456 DFS
+
+# Extended format with keywords
++ 123 456 DFS:keyword1,keyword2,keyword3
+#+end_example
+
+Modify =sync_state.c= parsing (note line 126 already hints at this):
+#+begin_src c
+char fbuf[16];  // enlarge when support for keywords is added
+#+end_src
+
+** 8. Configuration Options
+
+#+begin_example
+# mbsyncrc
+
+IMAPStore gmail
+Host imap.gmail.com
+# Enable keyword ↔ X-GM-LABELS mapping
+GMLabelsAsKeywords yes
+# Filter system labels (default: yes)
+FilterGMSystemLabels yes
+# Custom label prefix to add/strip
+GMLabelsPrefix ""
+#+end_example
+
+* Gmail Label Considerations
+
+** System Labels (require special handling)
+
+| Label          | Meaning              | Mapping Strategy          |
+|----------------+----------------------+---------------------------|
+| =\Inbox=       | INBOX folder         | Skip (folder, not keyword)|
+| =\Sent=        | Sent folder          | Skip                      |
+| =\Draft=       | Draft flag           | Map to \Draft flag        |
+| =\Spam=        | Spam folder          | Skip                      |
+| =\Trash=       | Trash folder         | Skip                      |
+| =\Important=   | Priority marker      | Map to keyword "Important"|
+| =\Starred=     | Starred/flagged      | Map to \Flagged flag      |
+
+** User Labels
+
+- Arbitrary strings, can contain spaces and Unicode
+- May be hierarchical: ="Projects/Work"=, ="Projects/Personal"=
+- Need proper quoting in IMAP commands
+
+* Maildir Side Considerations
+
+For Maildir stores (when syncing Gmail ↔ Maildir directly):
+
+** Option A: Info Field Extension (Non-standard)
+
+Some clients support extended info fields:
+#+begin_example
+message:2,FSkeyword1,keyword2
+#+end_example
+
+Drawback: Non-standard, filename length limits, no spaces/special chars.
+
+** Option B: Xattr/Sidecar Storage
+
+Store keywords in extended attributes or =.keywords= sidecar file.
+
+Drawback: Not portable across filesystems, extra file management.
+
+** Option C: Custom Header (Recommended)
+
+Add =X-Keywords:= header to message during sync.
+
+#+begin_example
+X-Keywords: project-alpha, urgent, waiting-for-reply
+#+end_example
+
+*** Advantages
+
+- Portable: header travels with message (backup, migration, other clients)
+- Standard format: RFC 5322 compliant header
+- No filename constraints: supports spaces, unicode, long keywords
+- Dovecot compatible: Dovecot can index =X-Keywords= header for search
+- Reversible: header can be parsed back to keywords on sync
+
+*** Implementation
+
+#+begin_src c
+// When writing to Maildir, inject header before first blank line
+void inject_keywords_header(char **msg, size_t *len, string_list_t *keywords) {
+    // Find end of headers (first \r\n\r\n or \n\n)
+    // Insert "X-Keywords: kw1, kw2, kw3\r\n" before body
+}
+
+// When reading from Maildir, parse header
+string_list_t *extract_keywords_header(const char *msg, size_t len) {
+    // Find X-Keywords: header, parse comma-separated values
+}
+#+end_src
+
+*** Header Format Specification
+
+#+begin_example
+X-Keywords: keyword1, keyword2, "keyword with spaces", keyword3
+#+end_example
+
+- Comma-separated list
+- Keywords with spaces/special chars are quoted
+- UTF-8 encoded (use RFC 2047 for non-ASCII if needed)
+- Multiple =X-Keywords= headers are merged
+
+*** Configuration
+
+#+begin_example
+MaildirStore local
+Path ~/Mail/
+# Store keywords in X-Keywords header (default: no)
+MaildirKeywordsHeader yes
+#+end_example
+
+*** Handling Existing Messages
+
+When =MaildirKeywordsHeader= is enabled:
+1. On first sync, existing messages without header get keywords added
+2. Header is only modified if keywords actually change (preserve mtime)
+3. Message UID changes may occur (new message = copy + delete old)
+
+*** Dovecot Integration
+
+Dovecot can be configured to use =X-Keywords= for virtual folder searches:
+
+#+begin_example
+# dovecot.conf
+mail_attribute_dict = file:%h/Maildir/dovecot-attributes
+
+# Enable header-based keyword search
+plugin {
+  fts_header_keywords = X-Keywords
+}
+#+end_example
+
+* Hierarchical Label Handling
+
+Gmail supports hierarchical labels like =Projects/Work/TaskA=. These need
+special handling when mapping to IMAP keywords.
+
+** Strategy: Preserve Hierarchy with Encoding
+
+Encode the hierarchy in the keyword using a safe separator:
+
+| Gmail Label           | IMAP Keyword              |
+|-----------------------+---------------------------|
+| =Projects=            | =Projects=                |
+| =Projects/Work=       | =Projects/Work=           |
+| =Projects/Work/TaskA= | =Projects/Work/TaskA=     |
+
+*** Why Preserve (Not Flatten)
+
+1. *Round-trip fidelity*: =Projects/Work= synced to Dovecot and back to Gmail
+   should remain =Projects/Work=, not become =Projects-Work=
+2. *Gmail UI*: Gmail displays hierarchy in label picker; flattening loses this
+3. *Search*: =label:Projects/Work= works in Gmail; flattened wouldn't
+
+*** IMAP Keyword Constraints
+
+Per RFC 3501, keywords (atoms) cannot contain:
+- Space, CTL chars, =(){}[]*%"\=
+- Forward slash =/= IS allowed in atoms
+
+So =Projects/Work= is a valid IMAP keyword. No encoding needed for hierarchy.
+
+*** Implementation
+
+#+begin_src c
+// Gmail label → IMAP keyword (hierarchy preserved)
+char *gm_label_to_keyword(const char *label) {
+    // Gmail labels can have spaces, need encoding
+    // "My Project/Sub Task" → "My_Project/Sub_Task" or quoted
+    return encode_for_imap_atom(label);
+}
+
+// IMAP keyword → Gmail label
+char *keyword_to_gm_label(const char *keyword) {
+    // Reverse the encoding
+    return decode_from_imap_atom(keyword);
+}
+#+end_src
+
+** Nested Label Sync Behavior
+
+When a parent label exists in Gmail:
+
+| Gmail State                          | Sync to Dovecot             |
+|--------------------------------------+-----------------------------|
+| Label =A= and =A/B= both on message  | Keywords: =A=, =A/B=        |
+| Only =A/B= on message                | Keyword: =A/B= only         |
+| =A= removed, =A/B= remains           | Remove =A=, keep =A/B=      |
+
+Note: Gmail sometimes implicitly adds parent labels. The sync should track
+explicit labels only, not infer hierarchy.
+
+* Invalid Keyword Character Handling
+
+Gmail labels can contain characters that are invalid in IMAP keywords.
+
+** IMAP Atom Constraints (RFC 3501)
+
+Valid atom characters:
+#+begin_example
+ATOM-CHAR = <any CHAR except atom-specials>
+atom-specials = "(" / ")" / "{" / SP / CTL / list-wildcards / quoted-specials
+list-wildcards = "%" / "*"
+quoted-specials = DQUOTE / "\"
+#+end_example
+
+Invalid in keywords: =( ) { } [ ] * % " \ SP CTL=
+
+** Gmail Label Characters
+
+Gmail allows almost anything in labels:
+- Spaces: "My Label"
+- Parentheses: "Project (2024)"
+- Special chars: "Urgent!!!", "Q&A"
+- Unicode: "日本語", "Ελληνικά"
+
+** Encoding Strategy: Percent-Encoding
+
+Use URL-style percent-encoding for invalid characters:
+
+| Gmail Label        | Encoded Keyword        | Notes                    |
+|--------------------+------------------------+--------------------------|
+| =My Label=         | =My%20Label=           | Space → %20              |
+| =Project (2024)=   | =Project%20%282024%29= | Space, parens encoded    |
+| =Q&A=              | =Q&A=                  | & is valid, no encoding  |
+| =50% Off=          | =50%25%20Off=          | % and space encoded      |
+| =日本語=           | =%E6%97%A5%E6%9C%AC...=| UTF-8 bytes percent-enc  |
+
+*** Implementation
+
+#+begin_src c
+// Characters that must be encoded in IMAP atoms
+static const char *must_encode = "(){}[] *%\"\\\x00-\x1f\x7f";
+
+char *encode_for_imap_atom(const char *label) {
+    // Calculate output size
+    size_t out_len = 0;
+    for (const char *p = label; *p; p++) {
+        if (strchr(must_encode, *p) || (*p & 0x80))
+            out_len += 3;  // %XX
+        else
+            out_len += 1;
+    }
+
+    char *out = malloc(out_len + 1);
+    char *q = out;
+    for (const char *p = label; *p; p++) {
+        if (strchr(must_encode, *p) || (*p & 0x80)) {
+            sprintf(q, "%%%02X", (unsigned char)*p);
+            q += 3;
+        } else {
+            *q++ = *p;
+        }
+    }
+    *q = '\0';
+    return out;
+}
+
+char *decode_from_imap_atom(const char *keyword) {
+    // Reverse: %XX → byte
+    size_t len = strlen(keyword);
+    char *out = malloc(len + 1);
+    char *q = out;
+    for (const char *p = keyword; *p; ) {
+        if (*p == '%' && isxdigit(p[1]) && isxdigit(p[2])) {
+            *q++ = (hexval(p[1]) << 4) | hexval(p[2]);
+            p += 3;
+        } else {
+            *q++ = *p++;
+        }
+    }
+    *q = '\0';
+    return out;
+}
+#+end_src
+
+** Alternative: Underscore Substitution (Simpler)
+
+For simpler implementation, replace spaces with underscores:
+
+| Gmail Label   | Keyword          |
+|---------------+------------------|
+| =My Label=    | =My_Label=       |
+| =A B C=       | =A_B_C=          |
+
+Drawback: Loses distinction between "My Label" and "My_Label".
+
+** Recommended: Percent-Encoding
+
+- Lossless round-trip
+- Standard encoding (URL-style)
+- Handles all edge cases including Unicode
+- Slight readability cost (=My%20Label= vs =My Label=)
+
+** Edge Cases
+
+*** Empty After Encoding
+
+If a label becomes empty or too long after encoding:
+#+begin_src c
+if (strlen(encoded) == 0 || strlen(encoded) > MAX_KEYWORD_LEN) {
+    warn("Gmail label '%s' cannot be represented as keyword, skipping\n", label);
+    return NULL;
+}
+#+end_src
+
+*** Collision Detection
+
+Two different labels could theoretically encode to same keyword (unlikely with
+percent-encoding, but possible with underscore substitution):
+#+begin_src c
+// Maintain mapping table in sync state
+// If collision detected, add numeric suffix: My_Label, My_Label_2
+#+end_src
+
+* Implementation Phases
+
+** Phase 1: Gmail X-GM-LABELS Read Support
+- Add X-GM-EXT-1 capability detection
+- Parse X-GM-LABELS in FETCH responses
+- Store labels in message structure
+- Display in verbose output
+
+** Phase 2: Keyword Data Structures
+- Enable string_list_t keywords in message/sync_rec
+- Add keyword fields to journal format
+- Implement keyword comparison/diff logic
+- Implement percent-encoding for invalid characters
+
+** Phase 3: Gmail ↔ IMAP Keyword Sync
+- Implement keyword ↔ X-GM-LABELS mapping (with hierarchy preservation)
+- Add STORE X-GM-LABELS command support
+- Sync keywords bidirectionally between Gmail and Dovecot
+- Filter Gmail system labels (=\Inbox=, =\Sent=, etc.)
+
+** Phase 4: Maildir Keyword Support (X-Keywords Header)
+- Implement header injection on Maildir write
+- Implement header parsing on Maildir read
+- Handle message rewrite (UID change) when keywords change
+- Enable Gmail ↔ Maildir keyword sync
+
+** Phase 5: Configuration & Polish
+- Add =MaildirKeywordsHeader= config option
+- Add =GMLabelsAsKeywords= config option
+- Handle edge cases (encoding collisions, max keyword length)
+- Documentation
+
+* Risk Analysis
+
+| Risk                            | Mitigation                              |
+|---------------------------------+-----------------------------------------|
+| Gmail API changes               | Feature-detect via capability string    |
+| Keyword encoding issues         | Use IMAP UTF-7 encoding                 |
+| Large label counts              | Implement pagination / batching         |
+| Journal format change           | Version journal, migration logic        |
+| Maildir compatibility           | Make maildir keywords optional          |
+
+* Design Decisions
+
+| Question                           | Decision                                    |
+|------------------------------------+---------------------------------------------|
+| Maildir keyword storage            | X-Keywords header injection                 |
+| Hierarchical labels                | Preserve hierarchy (=/= is valid in atoms)  |
+| Invalid keyword characters         | Percent-encoding (%20 for space, etc.)      |
+
+* Remaining Open Questions
+
+1. Should there be a configurable label ↔ keyword mapping table for special cases?
+2. What's the maximum practical keyword count to support per message?
+3. How to handle message rewrite/UID change on Maildir when only keywords change?
+4. Should keyword changes trigger full message re-upload or use IMAP APPEND?
+5. How to migrate existing synced mailboxes that have lost keywords?
+
+* References
+
+- [[https://developers.google.com/gmail/imap/imap-extensions][Gmail IMAP Extensions Documentation]]
+- [[https://www.rfc-editor.org/rfc/rfc3501][RFC 3501 - IMAP4rev1]]
+- [[https://cr.yp.to/proto/maildir.html][Maildir format specification]]
+- isync source: =drv_imap.c=, =sync.c=, =driver.h=
