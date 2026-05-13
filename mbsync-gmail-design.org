@@ -14,6 +14,8 @@ Gmail IMAP silently drops IMAP keywords (custom flags beyond the standard
 Gmail does support arbitrary labels via the proprietary =X-GM-LABELS= IMAP
 extension (capability =X-GM-EXT-1=).
 
+Existing ticket: https://sourceforge.net/p/isync/feature-requests/15/
+
 * Proposed Solution
 
 Implement bidirectional mapping between IMAP keywords and Gmail's =X-GM-LABELS=:
