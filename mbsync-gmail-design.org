@@ -2,6 +2,8 @@
 #+AUTHOR: Design Document
 #+DATE: 2026-05-13
 
+Claude analysis of solutions for synchronizing IMAP keyswords with purpose-broken Google mail IMAP.
+
 * Problem Statement
 
 Gmail IMAP silently drops IMAP keywords (custom flags beyond the standard
